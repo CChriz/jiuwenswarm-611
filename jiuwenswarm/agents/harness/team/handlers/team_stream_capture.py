@@ -181,6 +181,53 @@ class TeamStreamCapture(TeamStreamLogger):  # type: ignore[misc]
 # --------------------------------------------------------------------------
 # Offline grouping
 # --------------------------------------------------------------------------
+import ast
+import re
+
+
+def parse_tool_result(text: str) -> dict[str, Any]:
+    """Recover structured fields from a tool_result payload string.
+
+    On some builds the tool_call chunk is an empty placeholder and the real
+    information lands in the tool_result as a Python-repr string shaped like
+    ``{'tool_name': 'write_file', 'tool_call_id': '...', 'result': "success=True
+    data={'file_path': '...', 'content': '...'} error=None"}``. Parse the outer
+    dict, then best-effort pull file_path / content / files from the inner
+    ``result``. Always degrades to {"raw": text} rather than raising.
+    """
+    out: dict[str, Any] = {}
+    if not text:
+        return out
+    try:
+        outer = ast.literal_eval(text)
+    except Exception:
+        # Fall back to regex for tool_name if the repr won't eval.
+        m = re.search(r"'tool_name':\s*'([^']+)'", text)
+        return {"tool_name": m.group(1)} if m else {"raw": text[:2000]}
+    if not isinstance(outer, dict):
+        return {"raw": text[:2000]}
+    out["tool_name"] = outer.get("tool_name")
+    out["tool_call_id"] = outer.get("tool_call_id")
+    result = outer.get("result")
+    if isinstance(result, str):
+        # Try to lift file_path / line_count and the data={...} blob.
+        fp = re.search(r"'file_path':\s*'([^']*)'", result)
+        if fp:
+            out["file_path"] = fp.group(1)
+        data_m = re.search(r"data=(\{.*\})\s*(?:error=|$)", result, re.S)
+        if data_m:
+            try:
+                data = ast.literal_eval(data_m.group(1))
+                if isinstance(data, dict):
+                    for k in ("file_path", "content", "files", "dirs", "line_count"):
+                        if k in data and k not in out:
+                            out[k] = data[k]
+            except Exception:
+                pass
+        out.setdefault("result_summary", result[:300])
+    return out
+
+
 def group_turns(jsonl_path: str | Path) -> dict[str, list[dict[str, Any]]]:
     """Fold the flat per-event stream into per-member turns.
 
@@ -222,7 +269,15 @@ def group_turns(jsonl_path: str | Path) -> dict[str, list[dict[str, Any]]]:
                 "total_tokens": int(um.get("total_tokens") or 0),
                 "perf": d.get("perf", {}),
             }
-            # Close the turn.
+            # Close the turn. Recover real tool info from tool_result payloads
+            # (this build leaves tool_call placeholders empty).
+            actions = []
+            for tr in turn["tool_results"]:
+                rt = (tr.get("tool_result") or {})
+                rtext = rt.get("text", "") if isinstance(rt, dict) else str(rt)
+                parsed_tr = parse_tool_result(rtext)
+                if parsed_tr:
+                    actions.append(parsed_tr)
             prev = turns.get(m, [])
             prev_in = prev[-1]["usage"]["input_tokens"] if prev and prev[-1].get("usage") else 0
             closed = {
@@ -232,8 +287,9 @@ def group_turns(jsonl_path: str | Path) -> dict[str, list[dict[str, Any]]]:
                 "input_delta": turn["usage"]["input_tokens"] - prev_in,
                 "reasoning_text": "".join(turn["reasoning"]),
                 "answer_text": "".join(turn["answer"]),
-                "tool_calls": turn["tool_calls"],
-                "tool_results": turn["tool_results"],
+                "actions": actions,
+                "tool_calls_raw": turn["tool_calls"],
+                "tool_results_raw": turn["tool_results"],
             }
             turns.setdefault(m, []).append(closed)
             cur[m] = blank()
@@ -241,14 +297,26 @@ def group_turns(jsonl_path: str | Path) -> dict[str, list[dict[str, Any]]]:
 
 
 def _summary(turns: dict[str, list[dict[str, Any]]]) -> None:
-    print(f"{'member':<24} {'turns':>5} {'out_tok':>8} {'billed_in':>10} {'tool_calls':>11}")
-    print("-" * 62)
+    from collections import Counter
+    print(f"{'member':<24} {'turns':>5} {'out_tok':>8} {'billed_in':>10} {'actions':>8}")
+    print("-" * 60)
     for m in sorted(turns):
         ts = turns[m]
         out = sum(t["usage"]["output_tokens"] for t in ts if t.get("usage"))
         bin_ = sum(t["usage"]["input_tokens"] for t in ts if t.get("usage"))
-        tc = sum(len(t["tool_calls"]) for t in ts)
-        print(f"{m:<24} {len(ts):>5} {out:>8,} {bin_:>10,} {tc:>11}")
+        acts = sum(len(t["actions"]) for t in ts)
+        print(f"{m:<24} {len(ts):>5} {out:>8,} {bin_:>10,} {acts:>8}")
+    # Tool usage breakdown across all members.
+    tools = Counter()
+    for ts in turns.values():
+        for t in ts:
+            for a in t["actions"]:
+                if a.get("tool_name"):
+                    tools[a["tool_name"]] += 1
+    if tools:
+        print("\ntool usage (all members):")
+        for name, n in tools.most_common():
+            print(f"  {n:>3}  {name}")
 
 
 if __name__ == "__main__":
@@ -261,3 +329,4 @@ if __name__ == "__main__":
         print(f"\nWrote {out}")
     else:
         print(__doc__)
+
