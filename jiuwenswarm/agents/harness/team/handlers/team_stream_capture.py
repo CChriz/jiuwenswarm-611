@@ -4,48 +4,50 @@
 Two pieces, by design:
 
 1.  ``TeamStreamCapture`` — a drop-in ``TeamStreamLogger`` subclass. Pass it
-    as ``stream_logger=`` to ``Runner.run_agent_team_streaming`` and it writes
-    one JSON line per stream chunk to ``stream-{session}.jsonl`` — the flat,
-    uninterpreted SOURCE OF TRUTH. It also keeps the base class's human text
-    dump (free, harmless). It never raises into the run.
+    as ``stream_logger=`` to ``Runner.run_agent_team_streaming``; it writes one
+    JSON line per stream chunk to ``stream-{session}.jsonl`` — the flat,
+    uninterpreted SOURCE OF TRUTH. It also keeps the base class text dump. It
+    never raises into the run.
 
-2.  ``group_turns`` — an OFFLINE pass over that JSONL. It splits the global
-    stream by member (members run concurrently, so their chunks interleave),
-    then by LLM call within each member (each ``llm_usage`` chunk closes a
-    call), and emits per-member "turns" bundling the reasoning text, the tool
-    calls (with file contents), the tool results, and that call's exact token
-    usage. Grouping is a convenience derived from the flat log — if a heuristic
-    is ever wrong, the flat log is still authoritative.
+2.  ``group_turns`` — an OFFLINE pass over that JSONL. It splits the stream by
+    member (members run concurrently and interleave), then by LLM call within
+    each member (each ``llm_usage`` chunk closes a call), and emits per-member
+    "turns" bundling reasoning text, the actions taken, and the call's token
+    usage. Grouping is derived from the flat log — if a heuristic is wrong, the
+    flat log is still authoritative.
 
-Why two pieces: token usage is per-LLM-call, never per-action, and members
-interleave on the wire. Keeping the raw stream separate from the grouping
-means the recorded data can't be wrong; only the (re-derivable) grouping can.
+Action contents come from ``tracer_agent`` spans, which carry each tool
+invocation's full ``inputs``/``outputs`` (for a write, that's the file path AND
+the written content). Because there is one span per invocation, repeated writes
+to the same file produce distinct records with distinct contents — captured at
+write time, never overwritten. Tracer spans are NOT member-tagged on the wire,
+so they're attributed to the most recent member active in the stream (a
+proximity heuristic: spans arrive adjacent to the acting member's chunks).
 
-File-content policy: full content is stored inline when under MAX_INLINE_CHARS;
-larger payloads are clipped to a preview plus the true length and a sha1 of the
-full text, so a big file read is identifiable without bloating the log. Set
-MAX_INLINE_CHARS huge for "always full", or small for "previews only".
+File-content policy: full content inline under MAX_INLINE_CHARS; larger payloads
+clip to a preview + true length + sha1. Set huge for always-full, small for
+previews only.
 
 CLI:  python team_stream_capture.py group  stream-<session>.jsonl
 """
 
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
+import re
 import time
 from pathlib import Path
 from typing import Any, Optional
 
 try:
-    # Available in the jiuwenswarm runtime; only needed for live capture.
     from openjiuwen.agent_teams.monitor import TeamStreamLogger
 except Exception:  # offline grouping doesn't need the SDK
     TeamStreamLogger = object  # type: ignore
 
-MAX_INLINE_CHARS = 20_000  # store full content under this; clip + hash above it
+MAX_INLINE_CHARS = 20_000
 
-# Chunk type strings, mirroring openjiuwen.agent_teams.monitor.stream_logger.
 T_REASONING = "llm_reasoning"
 T_OUTPUT = "llm_output"
 T_ANSWER = "answer"
@@ -54,10 +56,10 @@ T_TOOL_RESULT = "tool_result"
 T_TOOL_UPDATE = "tool_update"
 T_MESSAGE = "message"
 T_USAGE = "llm_usage"
+T_TRACER = "tracer_agent"
 
 
-def _clip(text: str) -> dict[str, Any]:
-    """Return a content holder: full inline if small, else preview+len+sha1."""
+def _clip(text: Optional[str]) -> dict[str, Any]:
     if text is None:
         return {"text": None}
     if len(text) <= MAX_INLINE_CHARS:
@@ -79,14 +81,12 @@ def _as_text(payload: Any) -> str:
 
 
 def _member_of(chunk: Any) -> tuple[Optional[str], Optional[str]]:
-    """Return (member, role_str). Leader chunks carry no source_member."""
     src = getattr(chunk, "source_member", None)
     role = getattr(chunk, "role", None)
     role_str = getattr(role, "value", role)
     role_str = str(role_str).lower() if role_str is not None else None
     if src:
         return str(src), role_str
-    # Leader emits with source_member=None; label it from the role.
     if role_str and "lead" in role_str:
         return "team-leader", role_str
     return None, role_str
@@ -124,6 +124,21 @@ def _record_for(chunk: Any, seq: int) -> dict[str, Any]:
             "status": upd.get("status", "") if isinstance(upd, dict) else "",
             "tool_call_id": upd.get("tool_call_id", "") if isinstance(upd, dict) else "",
         }
+    elif ctype == T_TRACER and isinstance(payload, dict):
+        # OTel span flowing on the stream: per-invocation tool inputs (incl.
+        # write content) and outputs. THIS is where action contents live.
+        rec["data"] = {
+            "name": payload.get("name"),
+            "invoke_type": payload.get("invokeType"),
+            "invoke_id": payload.get("invokeId"),
+            "parent_invoke_id": payload.get("parentInvokeId"),
+            "status": payload.get("status"),
+            "elapsed_ms": payload.get("elapsedTime"),
+            "inputs": _clip(json.dumps(payload.get("inputs"), ensure_ascii=False)
+                            if payload.get("inputs") is not None else None),
+            "outputs": _clip(json.dumps(payload.get("outputs"), ensure_ascii=False)
+                             if payload.get("outputs") is not None else None),
+        }
     elif ctype == T_USAGE and isinstance(payload, dict):
         rec["data"] = {
             "usage_metadata": payload.get("usage_metadata", {}),
@@ -131,39 +146,28 @@ def _record_for(chunk: Any, seq: int) -> dict[str, Any]:
             "perf": {k: payload[k] for k in ("total_latency_ms", "ttft_ms", "tpot_ms") if k in payload},
         }
     else:
-        # message / controller_output / todo / unknown: keep capped raw text.
         rec["data"] = {"raw": _clip(_as_text(payload))}
     return rec
 
 
 class TeamStreamCapture(TeamStreamLogger):  # type: ignore[misc]
-    """Drop-in ``stream_logger`` that also writes a flat per-event JSONL.
-
-    Usage in team_helpers.py (replacing the existing TeamStreamLogger build)::
-
-        lg = TeamStreamCapture(
-            jsonl_path=str(traces_dir / f"stream-{session_id}.jsonl"),
-            dump_path=str(traces_dir / f"dump-team-{session_id}.txt"),
-        )
-        ... Runner.run_agent_team_streaming(..., stream_logger=lg)
-    """
+    """Drop-in ``stream_logger`` that writes a flat per-event JSONL."""
 
     def __init__(self, jsonl_path: str, dump_path: str | None = None) -> None:
-        # The base class requires a text-dump path; default it alongside.
         super().__init__(file_path=dump_path or (jsonl_path + ".dump.txt"))
         self._jsonl = open(jsonl_path, "a", encoding="utf-8")
         self._seq = 0
 
-    def feed(self, chunk: Any) -> None:  # called by the runner per chunk
+    def feed(self, chunk: Any) -> None:
         try:
             rec = _record_for(chunk, self._seq)
             self._seq += 1
             self._jsonl.write(json.dumps(rec, ensure_ascii=False) + "\n")
             self._jsonl.flush()
         except Exception:
-            pass  # capture must never break the run
+            pass
         try:
-            super().feed(chunk)  # keep the base text dump
+            super().feed(chunk)
         except Exception:
             pass
 
@@ -181,87 +185,198 @@ class TeamStreamCapture(TeamStreamLogger):  # type: ignore[misc]
 # --------------------------------------------------------------------------
 # Offline grouping
 # --------------------------------------------------------------------------
-import ast
-import re
+def _unclip(holder: Any) -> Optional[str]:
+    if isinstance(holder, dict):
+        return holder.get("text")
+    return holder if isinstance(holder, str) else None
+
+
+def _parse_inputs(inputs_text: Optional[str]) -> dict[str, Any]:
+    """Parse a tracer ``inputs`` JSON string and unwrap the inner arg dict.
+
+    Shape on this build: {"inputs": {"file_path": "...", "content": "..."}}.
+    """
+    if not inputs_text:
+        return {}
+    try:
+        obj = json.loads(inputs_text)
+    except Exception:
+        return {}
+    if isinstance(obj, dict) and isinstance(obj.get("inputs"), dict):
+        return obj["inputs"]
+    return obj if isinstance(obj, dict) else {}
 
 
 def parse_tool_result(text: str) -> dict[str, Any]:
-    """Recover structured fields from a tool_result payload string.
-
-    On some builds the tool_call chunk is an empty placeholder and the real
-    information lands in the tool_result as a Python-repr string shaped like
-    ``{'tool_name': 'write_file', 'tool_call_id': '...', 'result': "success=True
-    data={'file_path': '...', 'content': '...'} error=None"}``. Parse the outer
-    dict, then best-effort pull file_path / content / files from the inner
-    ``result``. Always degrades to {"raw": text} rather than raising.
-    """
+    """Fallback recovery from a tool_result repr string when no tracer exists."""
     out: dict[str, Any] = {}
     if not text:
         return out
     try:
         outer = ast.literal_eval(text)
     except Exception:
-        # Fall back to regex for tool_name if the repr won't eval.
         m = re.search(r"'tool_name':\s*'([^']+)'", text)
-        return {"tool_name": m.group(1)} if m else {"raw": text[:2000]}
+        return {"tool": m.group(1)} if m else {"raw": text[:2000]}
     if not isinstance(outer, dict):
         return {"raw": text[:2000]}
-    out["tool_name"] = outer.get("tool_name")
-    out["tool_call_id"] = outer.get("tool_call_id")
+    out["tool"] = outer.get("tool_name")
     result = outer.get("result")
     if isinstance(result, str):
-        # Try to lift file_path / line_count and the data={...} blob.
         fp = re.search(r"'file_path':\s*'([^']*)'", result)
         if fp:
             out["file_path"] = fp.group(1)
-        data_m = re.search(r"data=(\{.*\})\s*(?:error=|$)", result, re.S)
-        if data_m:
-            try:
-                data = ast.literal_eval(data_m.group(1))
-                if isinstance(data, dict):
-                    for k in ("file_path", "content", "files", "dirs", "line_count"):
-                        if k in data and k not in out:
-                            out[k] = data[k]
-            except Exception:
-                pass
-        out.setdefault("result_summary", result[:300])
+        out["result_summary"] = result[:300]
     return out
 
 
-def group_turns(jsonl_path: str | Path) -> dict[str, list[dict[str, Any]]]:
-    """Fold the flat per-event stream into per-member turns.
+def _action_from_tracer(merged: dict[str, Any]) -> dict[str, Any]:
+    args = _parse_inputs(_unclip(merged.get("inputs")))
+    action: dict[str, Any] = {
+        "tool": merged.get("name"),
+        "invoke_type": merged.get("invoke_type"),
+        "elapsed_ms": merged.get("elapsed_ms"),
+    }
+    for key in ("file_path", "path", "content", "command", "query", "pattern"):
+        if key in args:
+            action[key] = args[key]
+    action["inputs"] = args
+    out_text = _unclip(merged.get("outputs"))
+    if out_text:
+        action["outputs"] = out_text[:1000]
+    return action
 
-    A "turn" = one LLM call for a member: the reasoning + answer text streamed
-    before its ``llm_usage`` marker, the tool calls it made, the results, and
-    that call's token usage. ``input_delta`` is the rise in input_tokens since
-    the member's previous turn — an approximate marginal cost of whatever
-    entered context (e.g. a file read) between calls. It is a reconstruction,
-    not a provider-reported per-action figure.
+
+def _collect_tracer_spans(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Merge tracer start/finish pairs by invoke_id into one span each.
+
+    Returns a list of {seq, tool, file_path, content, inputs, outputs}, where
+    content/inputs come from whichever half carried them. These are the
+    content carriers; they're matched to member-tagged tool_results later.
     """
+    by_id: dict[Any, dict[str, Any]] = {}
+    order: list[Any] = []
+    for r in records:
+        if r.get("type") != T_TRACER:
+            continue
+        d = r.get("data") or {}
+        if not (d.get("name") or _unclip(d.get("inputs")) or _unclip(d.get("outputs"))):
+            continue
+        key = d.get("invoke_id") or ("noid", r.get("seq"))
+        if key not in by_id:
+            by_id[key] = {"seq": r.get("seq"), "data": dict(d)}
+            order.append(key)
+        else:
+            tgt = by_id[key]["data"]
+            for f in ("inputs", "outputs", "elapsed_ms", "status", "name"):
+                if not _unclip(tgt.get(f)) and d.get(f):
+                    tgt[f] = d[f]
+    spans = []
+    for k in order:
+        seq = by_id[k]["seq"]
+        a = _action_from_tracer(by_id[k]["data"])
+        # Prefer the resolved absolute path from the finish outputs if present.
+        out = _unclip(by_id[k]["data"].get("outputs"))
+        if out:
+            try:
+                od = json.loads(out)
+                rp = (od.get("outputs", {}) or {}).get("data", {})
+                if isinstance(rp, dict) and rp.get("file_path"):
+                    a["resolved_path"] = rp["file_path"]
+            except Exception:
+                pass
+        a["seq"] = seq
+        spans.append(a)
+    return spans
+
+
+def group_turns(jsonl_path: str | Path) -> dict[str, list[dict[str, Any]]]:
     records = [json.loads(l) for l in Path(jsonl_path).read_text(encoding="utf-8").splitlines() if l.strip()]
 
+    # Tracer spans (content carriers, no member) collected globally, in order.
+    tracer_spans = _collect_tracer_spans(records)
+    # Bucket tracer spans by tool, preserving seq order — for exact order-based
+    # pairing with member-tagged tool_results (k-th call <-> k-th span). Both
+    # streams are 1:1 per tool and globally ordered, so this is deterministic
+    # even when one member calls the same tool twice in a turn.
+    spans_by_tool: dict[str, list[dict[str, Any]]] = {}
+    for sp in sorted(tracer_spans, key=lambda s: s.get("seq", 0)):
+        spans_by_tool.setdefault(sp.get("tool"), []).append(sp)
+    span_cursor: dict[str, int] = {}
+    # Pre-count tool_results per tool so we can verify 1:1 and fall back safely.
+    res_seqs_by_tool: dict[str, list[int]] = {}
+    for r in records:
+        if r.get("type") == T_TOOL_RESULT and r.get("member"):
+            rt = (r.get("data") or {}).get("tool_result") or {}
+            rtext = rt.get("text", "") if isinstance(rt, dict) else str(rt)
+            tool = parse_tool_result(rtext).get("tool")
+            if tool:
+                res_seqs_by_tool.setdefault(tool, []).append(r.get("seq", 0))
+    # A tool is order-safe iff #tool_results == #tracer spans for it.
+    order_safe = {
+        tool: len(res_seqs_by_tool.get(tool, [])) == len(spans_by_tool.get(tool, []))
+        for tool in set(res_seqs_by_tool) | set(spans_by_tool)
+    }
+
+    def next_span_for(tool: str, seq: int) -> Optional[dict[str, Any]]:
+        spans = spans_by_tool.get(tool)
+        if not spans:
+            return None
+        if order_safe.get(tool):
+            i = span_cursor.get(tool, 0)
+            if i < len(spans):
+                span_cursor[tool] = i + 1
+                return spans[i]
+            return None
+        # Fallback: nearest unclaimed by seq (counts diverged for this tool).
+        best, best_i = None, None
+        for i, sp in enumerate(spans):
+            if sp.get("_used"):
+                continue
+            if best is None or abs(sp["seq"] - seq) < abs(best["seq"] - seq):
+                best, best_i = sp, i
+        if best_i is not None:
+            spans[best_i]["_used"] = True
+        return best
+
     turns: dict[str, list[dict[str, Any]]] = {}
-    cur: dict[str, dict[str, Any]] = {}  # member -> in-progress turn
+    cur: dict[str, dict[str, Any]] = {}
 
     def blank() -> dict[str, Any]:
-        return {"reasoning": [], "answer": [], "tool_calls": [], "tool_results": [], "usage": None}
+        return {"reasoning": [], "answer": [], "actions": [], "usage": None}
 
     for r in records:
-        m = r.get("member") or "(unknown)"
         t = r.get("type")
         d = r.get("data") or {}
+        m = r.get("member")
+        if not m:
+            continue  # only member-tagged chunks define turns; tracer joined here
         turn = cur.setdefault(m, blank())
+
         if t == T_REASONING:
-            turn["reasoning"].append((d or {}).get("text") or "")
+            turn["reasoning"].append(_unclip(d) or "")
         elif t in (T_OUTPUT, T_ANSWER):
-            turn["answer"].append((d or {}).get("text") or "")
-        elif t == T_TOOL_CALL:
-            turn["tool_calls"].append(d)
+            turn["answer"].append(_unclip(d) or "")
         elif t == T_TOOL_RESULT:
-            turn["tool_results"].append(d)
+            rt = d.get("tool_result") or {}
+            rtext = rt.get("text", "") if isinstance(rt, dict) else str(rt)
+            pa = parse_tool_result(rtext)  # {tool, file_path, result_summary}
+            tool = pa.get("tool")
+            action = {"tool": tool, "seq": r.get("seq")}
+            if pa.get("file_path"):
+                action["file_path"] = pa["file_path"]
+            sp = next_span_for(tool, r.get("seq")) if tool else None
+            if sp:
+                action["match"] = "order" if order_safe.get(tool) else "nearest_seq"
+                for k in ("content", "path", "command", "query", "pattern",
+                          "inputs", "outputs", "elapsed_ms", "resolved_path"):
+                    if sp.get(k) is not None and k not in action:
+                        action[k] = sp[k]
+                if not action.get("file_path") and sp.get("file_path"):
+                    action["file_path"] = sp["file_path"]
+            turn["actions"].append(action)
         elif t == T_USAGE:
             um = d.get("usage_metadata", {}) or {}
-            turn["usage"] = {
+            usage = {
                 "model": um.get("model_name"),
                 "input_tokens": int(um.get("input_tokens") or 0),
                 "output_tokens": int(um.get("output_tokens") or 0),
@@ -269,54 +384,46 @@ def group_turns(jsonl_path: str | Path) -> dict[str, list[dict[str, Any]]]:
                 "total_tokens": int(um.get("total_tokens") or 0),
                 "perf": d.get("perf", {}),
             }
-            # Close the turn. Recover real tool info from tool_result payloads
-            # (this build leaves tool_call placeholders empty).
-            actions = []
-            for tr in turn["tool_results"]:
-                rt = (tr.get("tool_result") or {})
-                rtext = rt.get("text", "") if isinstance(rt, dict) else str(rt)
-                parsed_tr = parse_tool_result(rtext)
-                if parsed_tr:
-                    actions.append(parsed_tr)
             prev = turns.get(m, [])
             prev_in = prev[-1]["usage"]["input_tokens"] if prev and prev[-1].get("usage") else 0
-            closed = {
+            turns.setdefault(m, []).append({
                 "member": m,
                 "turn": len(prev),
-                "usage": turn["usage"],
-                "input_delta": turn["usage"]["input_tokens"] - prev_in,
+                "usage": usage,
+                "input_delta": usage["input_tokens"] - prev_in,
                 "reasoning_text": "".join(turn["reasoning"]),
                 "answer_text": "".join(turn["answer"]),
-                "actions": actions,
-                "tool_calls_raw": turn["tool_calls"],
-                "tool_results_raw": turn["tool_results"],
-            }
-            turns.setdefault(m, []).append(closed)
+                "actions": turn["actions"],
+            })
             cur[m] = blank()
     return turns
 
 
 def _summary(turns: dict[str, list[dict[str, Any]]]) -> None:
     from collections import Counter
-    print(f"{'member':<24} {'turns':>5} {'out_tok':>8} {'billed_in':>10} {'actions':>8}")
+    print(f"{'member':<24} {'turns':>5} {'out_tok':>8} {'billed_in':>11} {'actions':>8}")
     print("-" * 60)
     for m in sorted(turns):
         ts = turns[m]
         out = sum(t["usage"]["output_tokens"] for t in ts if t.get("usage"))
         bin_ = sum(t["usage"]["input_tokens"] for t in ts if t.get("usage"))
         acts = sum(len(t["actions"]) for t in ts)
-        print(f"{m:<24} {len(ts):>5} {out:>8,} {bin_:>10,} {acts:>8}")
-    # Tool usage breakdown across all members.
-    tools = Counter()
+        print(f"{m:<24} {len(ts):>5} {out:>8,} {bin_:>11,} {acts:>8}")
+    tools: Counter = Counter()
+    writes = 0
     for ts in turns.values():
         for t in ts:
             for a in t["actions"]:
-                if a.get("tool_name"):
-                    tools[a["tool_name"]] += 1
+                name = a.get("tool")
+                if name:
+                    tools[name] += 1
+                if a.get("content") is not None and (a.get("file_path") or a.get("path")):
+                    writes += 1
     if tools:
         print("\ntool usage (all members):")
         for name, n in tools.most_common():
             print(f"  {n:>3}  {name}")
+    print(f"\nwrite-type actions with captured content: {writes}")
 
 
 if __name__ == "__main__":
@@ -329,4 +436,5 @@ if __name__ == "__main__":
         print(f"\nWrote {out}")
     else:
         print(__doc__)
+
 
