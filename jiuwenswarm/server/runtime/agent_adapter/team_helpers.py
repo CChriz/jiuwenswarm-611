@@ -1,5 +1,7 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
 
+# all modifications noted in comments
+
 """Team agent streaming helpers."""
 
 from __future__ import annotations
@@ -14,6 +16,8 @@ from openjiuwen.agent_teams.paths import get_agent_teams_home
 from openjiuwen.agent_teams.runtime import RunActionKind
 from openjiuwen.agent_teams.schema.team import TeamRole
 from openjiuwen.agent_teams.monitor import TeamStreamLogger
+### additional team stream capture module
+from jiuwenswarm.agents.harness.team.handlers.team_stream_capture import TeamStreamCapture
 from openjiuwen.core.runner import Runner
 from openjiuwen.harness import DeepAgent
 
@@ -87,6 +91,17 @@ _INTERACT_REASON_ERROR_MAP: dict[str, str] = {
     "no_team_backend": "Team backend not ready, please try again later",
 }
 
+### _Tee module for forwarding to additional logger
+class _Tee:
+    """Forward stream-logger callbacks (feed/flush) to multiple loggers."""
+    def __init__(self, *loggers):
+        self._loggers = [l for l in loggers if l is not None]
+    def feed(self, chunk):
+        for l in self._loggers:
+            l.feed(chunk)
+    def flush(self):
+        for l in self._loggers:
+            l.flush()
 
 def _strip_directive(query: str, prefix: str) -> tuple[str, bool]:
     """Strip a leading slash directive from a query string.
@@ -170,42 +185,6 @@ def restore_workflow_runs(session_id: str) -> dict[str, WorkflowRunState] | None
 
 def _resolve_channel_id(channel_id: str | None) -> str:
     return str(channel_id or "default").strip() or "default"
-
-
-def _resolve_request_language(request: Any) -> str:
-    metadata = getattr(request, "metadata", None)
-    params = getattr(request, "params", None)
-    sources = []
-    if isinstance(metadata, dict):
-        sources.append(metadata)
-    if isinstance(params, dict):
-        sources.append(params)
-
-    for source in sources:
-        for key in ("language", "preferred_language", "preferred_response_language"):
-            value = source.get(key)
-            if value:
-                return str(value).strip().lower() or "zh"
-    return "zh"
-
-
-def _safe_query_preview(query: Any, limit: int = 200) -> str:
-    if isinstance(query, str):
-        return query[:limit]
-    return str(query)[:limit]
-
-
-def _normalize_team_query(query: Any, *, channel_id: str | None, language: str) -> Any:
-    from jiuwenswarm.server.runtime.a2ui.integration import build_user_prompt_if_a2ui_event
-
-    a2ui_prompt = build_user_prompt_if_a2ui_event(
-        query,
-        channel=_resolve_channel_id(channel_id),
-        language=language,
-    )
-    if a2ui_prompt is not None:
-        return a2ui_prompt
-    return query
 
 
 async def ensure_monitor_handlers_for_active_runtime(
@@ -766,12 +745,7 @@ async def process_team_message_stream(
     channel_id = request.channel_id
 
     team_manager = get_team_manager(channel_id)
-    language = _resolve_request_language(request)
-    query = _normalize_team_query(
-        inputs.get("query", ""),
-        channel_id=channel_id,
-        language=language,
-    )
+    query = inputs.get("query", "")
     query_text = query if isinstance(query, str) else ""
     try:
         from jiuwenswarm.agents.harness.team.remote_member_bootstrap import (
@@ -970,7 +944,7 @@ async def process_team_message_stream(
                         _resolve_channel_id(channel_id),
                         session_id,
                         reason,
-                        _safe_query_preview(query),
+                        query[:200],
                     )
                     error_msg = _INTERACT_REASON_ERROR_MAP.get(reason or "",
                         "Failed to send message, please try again later")
@@ -1106,6 +1080,25 @@ async def _consume_stream_with_query(
                 "is_complete": False,
             },
         )
+
+        ### og
+        # stream_trace_enabled = bool(
+        #     _envs.get(_STREAM_TRACE_ENV_KEY) or os.environ.get(_STREAM_TRACE_ENV_KEY)
+        # )
+        # lg: TeamStreamLogger | None = None
+        # if stream_trace_enabled:
+        #     traces_dir = get_agent_teams_home() / "traces"
+        #     traces_dir.mkdir(parents=True, exist_ok=True)
+        #     lg = TeamStreamLogger(file_path=str(traces_dir / f"dump-team-{session_id}.txt"))
+        # async for chunk in Runner.run_agent_team_streaming(
+        #     agent_team=team_spec,
+        #     inputs={"query": initial_query},
+        #     session=session_id,
+        #     envs=envs,
+        #     stream_logger=lg,
+        # ):
+
+        ### new ###
         stream_trace_enabled = bool(
             _envs.get(_STREAM_TRACE_ENV_KEY) or os.environ.get(_STREAM_TRACE_ENV_KEY)
         )
@@ -1114,13 +1107,29 @@ async def _consume_stream_with_query(
             traces_dir = get_agent_teams_home() / "traces"
             traces_dir.mkdir(parents=True, exist_ok=True)
             lg = TeamStreamLogger(file_path=str(traces_dir / f"dump-team-{session_id}.txt"))
+
+        ## + always-on JSONL capture, independent of the trace flag 
+        cap = None
+        try:
+            cap_dir = get_agent_teams_home() / "traces"
+            cap_dir.mkdir(parents=True, exist_ok=True)
+            cap = TeamStreamCapture(
+                jsonl_path=str(cap_dir / f"stream-{session_id}.jsonl"),
+                dump_path=str(cap_dir / f"capture-{session_id}.dump.txt"),
+            )
+        except Exception as exc:
+            logger.warning("[TeamHelpers] stream capture init failed: %s", exc)
+        ##
+
         async for chunk in Runner.run_agent_team_streaming(
             agent_team=team_spec,
             inputs={"query": initial_query},
             session=session_id,
             envs=envs,
-            stream_logger=lg,
-        ):
+            stream_logger=_Tee(lg, cap),   # was: stream_logger=lg
+        ):   
+        ### end new ###
+
             received_chunks += 1
             is_leader = _is_leader_output(chunk)
             is_teammate = _is_teammate_output(chunk)
@@ -1246,7 +1255,7 @@ async def _consume_monitor_events(
             session_id,
         )
         async for event in monitor_handler.events():
-            _persist_team_history_event(channel_id, session_id, event)
+            _persist_team_member_status_event(channel_id, session_id, event)
             _broadcast_event(channel_id, session_id, event)
 
         logger.info(
@@ -1323,44 +1332,35 @@ async def _consume_workflow_events(
         )
 
 
-def _persist_team_history_event(
+def _persist_team_member_status_event(
     channel_id: str | None,
     session_id: str,
     event: dict[str, Any],
 ) -> None:
-    """Persist team monitor events required by team.history.get panel restore."""
-    evt_type = event.get("event_type")
-    if evt_type not in {"team.member", "team.task"}:
+    """Persist member status changes so team.history.get can restore refresh state."""
+    if event.get("event_type") != "team.member":
         return
 
     payload = event.get("event")
     if not isinstance(payload, dict):
         return
+    if payload.get("type") != "team.member.status_changed":
+        return
 
-    request_key = ""
-    if evt_type == "team.member":
-        if payload.get("type") != "team.member.status_changed":
-            return
-        member_id = str(payload.get("member_id") or "").strip()
-        new_status = str(payload.get("new_status") or "").strip()
-        if not member_id or not new_status:
-            return
-        request_key = member_id
-    else:
-        task_id = str(payload.get("task_id") or payload.get("id") or "").strip()
-        if not task_id:
-            return
-        request_key = task_id
+    member_id = str(payload.get("member_id") or "").strip()
+    new_status = str(payload.get("new_status") or "").strip()
+    if not member_id or not new_status:
+        return
 
     timestamp = time.time()
     append_history_record(
         session_id=session_id,
-        request_id=f"{evt_type}-{request_key}-{int(timestamp * 1000)}",
+        request_id=f"team-status-{member_id}-{int(timestamp * 1000)}",
         channel_id=_resolve_channel_id(channel_id),
         role="assistant",
         content="",
         timestamp=timestamp,
-        event_type=event_type,
+        event_type="team.member",
         extra={
             "session_id": session_id,
             "event": dict(payload),
