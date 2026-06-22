@@ -35,6 +35,8 @@ _WRAPPED_SESSION_ID_ATTR = "_jiuwen_spawn_member_remote_bootstrap_session_id"
 _WRAPPED_CHANNEL_ID_ATTR = "_jiuwen_spawn_member_remote_bootstrap_channel_id"
 _WRAPPED_REMOTE_NAMES_ATTR = "_jiuwen_spawn_member_remote_bootstrap_remote_names"
 _WRAPPED_REMOTE_ALL_ATTR = "_jiuwen_spawn_member_remote_bootstrap_remote_all"
+# NEW SPAWN WRAPPER: rebinds spawn_member to a wrapper that sends a bootstrap message
+_SPAWN_WRAPPER_REBIND_ATTR = "_jiuwen_spawn_member_wrapper_rebind_scheduled"
 _LOCAL_SPAWN_GUARD_ATTR = "_jiuwen_distributed_local_spawn_guard_attached"
 _SEND_MESSAGE_GUARDED_ATTR = "_jiuwen_distributed_send_message_guarded"
 _ACK_LISTENER_ATTR = "_jiuwen_remote_bootstrap_ack_listener_attached"
@@ -124,15 +126,38 @@ def _team_agent_deep_agent(team_agent: Any) -> Any | None:
     return getattr(harness, "_deep_agent", None)
 
 
+# def _spawn_member_tool_id(leader_deep_agent: Any) -> str:
+#     """Resolve qualified tool id (inprocess mode rewrites card ids)."""
+#     try:
+#         for card in leader_deep_agent.ability_manager.list() or []:
+#             cid = getattr(card, "id", "") or ""
+#             if cid == "team.spawn_member" or cid.startswith("team.spawn_member."):
+#                 return cid
+#     except Exception as exc:
+#         logger.warning("[RemoteMemberBootstrap] spawn_member tool id resolve failed: %s", exc)
+#     return "team.spawn_member"
+
+
 def _spawn_member_tool_id(leader_deep_agent: Any) -> str:
-    """Resolve qualified tool id (inprocess mode rewrites card ids)."""
+    """Resolve the leader spawn tool id.
+
+    openjiuwen registers this tool as ``spawn_member`` in some versions and
+    ``spawn_teammate`` in others; bind to whichever is actually present.
+    """
+    candidates = ("team.spawn_member", "team.spawn_teammate")
     try:
-        for card in leader_deep_agent.ability_manager.list() or []:
-            cid = getattr(card, "id", "") or ""
-            if cid == "team.spawn_member" or cid.startswith("team.spawn_member."):
-                return cid
+        cards = list(leader_deep_agent.ability_manager.list() or [])
+        for base in candidates:
+            for card in cards:
+                cid = getattr(card, "id", "") or ""
+                if cid == base or cid.startswith(base + "."):
+                    return cid
+        for card in cards:
+            name = getattr(card, "name", "") or ""
+            if name in ("spawn_member", "spawn_teammate"):
+                return getattr(card, "id", "") or f"team.{name}"
     except Exception as exc:
-        logger.warning("[RemoteMemberBootstrap] spawn_member tool id resolve failed: %s", exc)
+        logger.warning("[RemoteMemberBootstrap] spawn tool id resolve failed: %s", exc)
     return "team.spawn_member"
 
 
@@ -1012,6 +1037,81 @@ async def _ensure_remote_member_record(
             team_name,
         )
 
+# New schedule wrapper rebind logic to retry until the lazily-registered tool exists
+
+def _schedule_spawn_wrapper_rebind(
+    team_agent: Any,
+    *,
+    session_id: str,
+    channel_id: str | None,
+    attempts: int = 30,
+    interval: float = 1.0,
+) -> None:
+    """Retry binding the spawn wrapper until the lazily-registered tool exists."""
+    if getattr(team_agent, _SPAWN_WRAPPER_REBIND_ATTR, False):
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        logger.warning(
+            "[RemoteMemberBootstrap] spawn tool not registered and no running loop; "
+            "wrapper not bound session_id=%s",
+            session_id,
+        )
+        return
+    setattr(team_agent, _SPAWN_WRAPPER_REBIND_ATTR, True)
+    logger.info(
+        "[RemoteMemberBootstrap] spawn tool not registered yet; scheduling wrapper rebind "
+        "session_id=%s channel=%s",
+        session_id,
+        channel_id,
+    )
+
+    async def _runner() -> None:
+        from openjiuwen.core.runner import Runner
+
+        for _ in range(max(1, attempts)):
+            await asyncio.sleep(interval)
+            try:
+                leader = _team_agent_deep_agent(team_agent)
+                if leader is None:
+                    continue
+                tool_id = _spawn_member_tool_id(leader)
+                tag = getattr(getattr(leader, "card", None), "id", None)
+                tool = Runner.resource_mgr.get_tool(tool_id, tag=tag) if tag else None
+                if tool is None:
+                    tool = Runner.resource_mgr.get_tool(tool_id)
+                if tool is None:
+                    continue
+                attach_spawn_member_remote_bootstrap_wrapper(
+                    team_agent,
+                    session_id=session_id,
+                    channel_id=channel_id,
+                )
+                if getattr(tool, _WRAPPED_ATTR, False):
+                    logger.info(
+                        "[RemoteMemberBootstrap] spawn wrapper bound on retry tool_id=%s session_id=%s",
+                        tool_id,
+                        session_id,
+                    )
+                    return
+            except Exception as exc:
+                logger.warning(
+                    "[RemoteMemberBootstrap] spawn wrapper rebind attempt failed session_id=%s: %s",
+                    session_id,
+                    exc,
+                )
+        setattr(team_agent, _SPAWN_WRAPPER_REBIND_ATTR, False)
+        logger.warning(
+            "[RemoteMemberBootstrap] spawn wrapper NOT bound after %s attempts session_id=%s "
+            "(leader will spawn without remote bootstrap)",
+            attempts,
+            session_id,
+        )
+
+    loop.create_task(_runner())
+
+
 
 def attach_spawn_member_remote_bootstrap_wrapper(
     team_agent: Any,
@@ -1040,14 +1140,28 @@ def attach_spawn_member_remote_bootstrap_wrapper(
     tool_id = _spawn_member_tool_id(leader)
     tag = getattr(getattr(leader, "card", None), "id", None)
     tool = Runner.resource_mgr.get_tool(tool_id, tag=tag) if tag else None
+    # if tool is None:
+    #     tool = Runner.resource_mgr.get_tool(tool_id)
+    # if tool is None:
+    #     logger.debug(
+    #         "[RemoteMemberBootstrap] tool %s not in Runner.resource_mgr (session_id=%s channel=%s)",
+    #         tool_id,
+    #         session_id,
+    #         channel_id,
+    #     )
+    #     return
     if tool is None:
         tool = Runner.resource_mgr.get_tool(tool_id)
     if tool is None:
-        logger.debug(
-            "[RemoteMemberBootstrap] tool %s not in Runner.resource_mgr (session_id=%s channel=%s)",
+        logger.info(
+            "[RemoteMemberBootstrap] spawn tool %s not in Runner.resource_mgr yet; will retry "
+            "(session_id=%s channel=%s)",
             tool_id,
             session_id,
             channel_id,
+        )
+        _schedule_spawn_wrapper_rebind(
+            team_agent, session_id=session_id, channel_id=channel_id
         )
         return
     remote_names = remote_member_names(config_base)
@@ -1158,7 +1272,7 @@ def attach_spawn_member_remote_bootstrap_wrapper(
                 db = getattr(tb, "db", None) if tb is not None else None
                 team_name = _team_name_for_agent(active_team_agent)
                 if db is not None and isinstance(team_name, str) and team_name.strip():
-                    await db.update_member_status(key, team_name, MemberStatus.UNSTARTED.value)
+                    await db.member.update_member_status(key, team_name, MemberStatus.UNSTARTED.value)
                     logger.info(
                         "[RemoteMemberBootstrap] spawn_member member=%s status forced to UNSTARTED "
                         "until remote ACK team=%s",
@@ -1207,7 +1321,7 @@ def attach_spawn_member_remote_bootstrap_wrapper(
                 db = getattr(tb, "db", None) if tb is not None else None
                 team_name = _team_name_for_agent(active_team_agent)
                 if db is not None and isinstance(team_name, str) and team_name.strip():
-                    await db.update_member_status(key, team_name, MemberStatus.ERROR.value)
+                    await db.member.update_member_status(key, team_name, MemberStatus.ERROR.value)
             except Exception as exc:
                 logger.warning(
                     "[RemoteMemberBootstrap] failed to mark remote member ERROR after bootstrap failure "
@@ -1236,7 +1350,7 @@ def attach_spawn_member_remote_bootstrap_wrapper(
                     db = getattr(tb, "db", None) if tb is not None else None
                     team_name = _team_name_for_agent(active_team_agent)
                     if db is not None and isinstance(team_name, str) and team_name.strip():
-                        await db.update_member_status(key, team_name, MemberStatus.ERROR.value)
+                        await db.member.update_member_status(key, team_name, MemberStatus.ERROR.value)
                 except Exception as mark_exc:
                     logger.warning(
                         "[RemoteMemberBootstrap] failed to mark remote member ERROR after hook exception "
@@ -1722,7 +1836,7 @@ def attach_remote_bootstrap_ack_listener(
             )
             return
 
-        ok = await tb.db.update_member_status(ack_member, team_name, MemberStatus.READY.value)
+        ok = await tb.db.member.update_member_status(ack_member, team_name, MemberStatus.READY.value)
         if not ok:
             logger.warning(
                 "[RemoteMemberBootstrap] ACK: update_member_status failed member=%s team=%s",
@@ -2086,7 +2200,22 @@ async def _ensure_dynamic_member_execution_loop(
         )
         token = set_session_id(sid)
         try:
-            await teammate_agent.invoke({"query": kickoff}, session=None)
+            # await teammate_agent.invoke({"query": kickoff}, session=None)
+            
+            # Build a real AgentTeamSession so CoordinationKernel.start() takes the
+            # `session is not None` branch and actually starts the native harness
+            # supervisor (kernel.py:128-135). With session=None the supervisor was
+            # never created, so the teammate's deliver_input()/send() enqueued
+            # _CmdSend commands that nothing consumed — coordination ran (mailbox
+            # poll/drain logged "processing N unread") but no ReAct round ever
+            # started. Empty query: spawn must not fabricate a round; the mailbox
+            # poll delivers the real assigned task, which the now-live supervisor
+            # turns into a round via _on_send's IDLE branch.
+            from openjiuwen.core.session.agent_team import Session as _AgentTeamSession
+            _team_id = str(getattr(spec_obj, "team_name", "") or "") or "agent_team"
+            _teammate_session = _AgentTeamSession(session_id=sid, team_id=_team_id)
+            await _teammate_session.pre_run(inputs={"query": ""})
+            await teammate_agent.invoke({"query": ""}, session=_teammate_session)
         finally:
             reset_session_id(token)
             if (sid, member) in _DYNAMIC_MEMBER_AGENTS:

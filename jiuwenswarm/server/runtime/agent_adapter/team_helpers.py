@@ -14,6 +14,8 @@ from openjiuwen.agent_teams.paths import get_agent_teams_home
 from openjiuwen.agent_teams.runtime import RunActionKind
 from openjiuwen.agent_teams.schema.team import TeamRole
 from openjiuwen.agent_teams.monitor import TeamStreamLogger
+### additional team stream capture module
+from jiuwenswarm.agents.harness.team.handlers.team_stream_capture import TeamStreamCapture
 from openjiuwen.core.runner import Runner
 from openjiuwen.harness import DeepAgent
 
@@ -87,6 +89,17 @@ _INTERACT_REASON_ERROR_MAP: dict[str, str] = {
     "no_team_backend": "Team backend not ready, please try again later",
 }
 
+### _Tee module for forwarding to additional logger
+class _Tee:
+    """Forward stream-logger callbacks (feed/flush) to multiple loggers."""
+    def __init__(self, *loggers):
+        self._loggers = [l for l in loggers if l is not None]
+    def feed(self, chunk):
+        for l in self._loggers:
+            l.feed(chunk)
+    def flush(self):
+        for l in self._loggers:
+            l.flush()
 
 def _strip_directive(query: str, prefix: str) -> tuple[str, bool]:
     """Strip a leading slash directive from a query string.
@@ -1065,6 +1078,25 @@ async def _consume_stream_with_query(
                 "is_complete": False,
             },
         )
+
+        ### og
+        # stream_trace_enabled = bool(
+        #     _envs.get(_STREAM_TRACE_ENV_KEY) or os.environ.get(_STREAM_TRACE_ENV_KEY)
+        # )
+        # lg: TeamStreamLogger | None = None
+        # if stream_trace_enabled:
+        #     traces_dir = get_agent_teams_home() / "traces"
+        #     traces_dir.mkdir(parents=True, exist_ok=True)
+        #     lg = TeamStreamLogger(file_path=str(traces_dir / f"dump-team-{session_id}.txt"))
+        # async for chunk in Runner.run_agent_team_streaming(
+        #     agent_team=team_spec,
+        #     inputs={"query": initial_query},
+        #     session=session_id,
+        #     envs=envs,
+        #     stream_logger=lg,
+        # ):
+
+        ### new ###
         stream_trace_enabled = bool(
             _envs.get(_STREAM_TRACE_ENV_KEY) or os.environ.get(_STREAM_TRACE_ENV_KEY)
         )
@@ -1073,13 +1105,29 @@ async def _consume_stream_with_query(
             traces_dir = get_agent_teams_home() / "traces"
             traces_dir.mkdir(parents=True, exist_ok=True)
             lg = TeamStreamLogger(file_path=str(traces_dir / f"dump-team-{session_id}.txt"))
+
+        ## + always-on JSONL capture, independent of the trace flag 
+        cap = None
+        try:
+            cap_dir = get_agent_teams_home() / "traces"
+            cap_dir.mkdir(parents=True, exist_ok=True)
+            cap = TeamStreamCapture(
+                jsonl_path=str(cap_dir / f"stream-{session_id}.jsonl"),
+                dump_path=str(cap_dir / f"capture-{session_id}.dump.txt"),
+            )
+        except Exception as exc:
+            logger.warning("[TeamHelpers] stream capture init failed: %s", exc)
+        ##
+
         async for chunk in Runner.run_agent_team_streaming(
             agent_team=team_spec,
             inputs={"query": initial_query},
             session=session_id,
             envs=envs,
-            stream_logger=lg,
-        ):
+            stream_logger=_Tee(lg, cap),   # was: stream_logger=lg
+        ):   
+        ### end new ###
+
             received_chunks += 1
             is_leader = _is_leader_output(chunk)
             is_teammate = _is_teammate_output(chunk)
