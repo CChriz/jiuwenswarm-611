@@ -24,6 +24,9 @@ import socket
 import types
 import uuid
 from typing import Any, NamedTuple
+import os
+import json
+import functools
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +66,36 @@ class RemoteSpawnPrecheck(NamedTuple):
 
     error: str | None = None
     registry_reservation: Any | None = None
+
+
+# new spawn_member wrapper: 
+# after DB insert, send a control message to the remote teammate
+# persona map: JIUWEN_TEAM_PERSONA_MAP -> path to JSON, either team_spec.json shape
+@functools.lru_cache(maxsize=1)
+def _load_persona_map() -> dict:
+    """Deterministic per-member persona map (benchmark mode). Empty when unset.
+    JIUWEN_TEAM_PERSONA_MAP -> path to JSON, either team_spec.json shape
+    ({"members":[{member_name,persona,prompt_hint}]}) or a flat
+    {member_name: {persona, prompt_hint}} mapping."""
+    path = os.environ.get("JIUWEN_TEAM_PERSONA_MAP", "").strip()
+    if not path:
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            raw = json.loads(fh.read())
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[RemoteMemberBootstrap] persona map load failed path=%s: %s", path, exc)
+        return {}
+    out: dict = {}
+    if isinstance(raw, dict) and isinstance(raw.get("members"), list):
+        for m in raw["members"]:
+            if isinstance(m, dict) and m.get("member_name"):
+                out[str(m["member_name"])] = m
+    elif isinstance(raw, dict):
+        for k, v in raw.items():
+            if isinstance(v, dict):
+                out[str(k)] = v
+    return out
 
 
 def remote_member_names(config_base: dict[str, Any] | None = None) -> set[str]:
@@ -995,12 +1028,41 @@ async def _ensure_remote_member_record(
     from openjiuwen.agent_teams.schema.status import ExecutionStatus, MemberMode, MemberStatus
     from openjiuwen.core.single_agent.schema.agent_card import AgentCard
 
+    # data = inputs or {}
+    # display_name = str(data.get("display_name") or member_name).strip() or member_name
+    # desc = str(data.get("desc") or data.get("description") or "").strip() or None
+    # prompt = data.get("prompt")
+    # if prompt is not None:
+    #     prompt = str(prompt)
+
+
+    # ADDED deterministic fixed persona for better control
+    # determine display_name, desc, prompt from inputs / persona map
     data = inputs or {}
-    display_name = str(data.get("display_name") or member_name).strip() or member_name
-    desc = str(data.get("desc") or data.get("description") or "").strip() or None
-    prompt = data.get("prompt")
-    if prompt is not None:
-        prompt = str(prompt)
+    # Deterministic role persona (benchmark mode): when spawn inputs carry no
+    # desc/prompt (the blank-teammate adoption path never does), fall back to the
+    # fixed persona map keyed by member_name. desc -> team_member.desc ->
+    # build_context_from_db sets ctx.persona (spawn_manager line 341) ->
+    # TeamPolicyRail persona section. Same column/read as local build_team.
+    _pentry = _load_persona_map().get(member_name, {})
+    display_name = (
+        str(data.get("display_name") or _pentry.get("display_name") or member_name).strip()
+        or member_name
+    )
+    desc = (
+        str(data.get("desc") or data.get("description") or _pentry.get("persona") or "").strip()
+        or None
+    )
+    _prompt_src = data.get("prompt")
+    if _prompt_src is None:
+        _prompt_src = _pentry.get("prompt_hint")
+    prompt = str(_prompt_src) if _prompt_src is not None else None
+    if _pentry and desc:
+        logger.info(
+            "[RemoteMemberBootstrap] role persona set on member row member=%s persona_len=%s",
+            member_name, len(desc),
+        )
+
 
     _tn = getattr(team_agent, "_team_name", None)
     team_name = _tn() if callable(_tn) else getattr(tb, "team_name", "")
