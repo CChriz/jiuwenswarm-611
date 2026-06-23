@@ -1049,14 +1049,39 @@ async def _ensure_remote_member_record(
         str(data.get("display_name") or _pentry.get("display_name") or member_name).strip()
         or member_name
     )
-    desc = (
-        str(data.get("desc") or data.get("description") or _pentry.get("persona") or "").strip()
-        or None
-    )
+
+    # desc = (
+    #     str(data.get("desc") or data.get("description") or _pentry.get("persona") or "").strip()
+    #     or None
+    # )
+
+    # Benchmark mode: the persona map is AUTHORITATIVE. If a map entry exists for
+    # this member, its persona overrides whatever the leader LLM passed, so role
+    # personas are deterministic and not LLM-invented. Falls back to LLM-supplied
+    # desc only when the member is not in the map.
+
+    # ADDED precedence: use the persona map entry if it exists, else use the LLM-supplied desc/description
+    _map_persona = str(_pentry.get("persona") or "").strip()
+    if _map_persona:
+        desc = _map_persona
+    else:
+        desc = str(data.get("desc") or data.get("description") or "").strip() or None
+
     _prompt_src = data.get("prompt")
     if _prompt_src is None:
         _prompt_src = _pentry.get("prompt_hint")
-    prompt = str(_prompt_src) if _prompt_src is not None else None
+    
+    # prompt = str(_prompt_src) if _prompt_src is not None else None
+
+    # ADDED precedence: use the persona map entry if it exists, else use the LLM-supplied prompt
+    _map_hint = _pentry.get("prompt_hint")
+    if _map_hint is not None:
+        prompt = str(_map_hint)
+    else:
+        _prompt_src = data.get("prompt")
+        prompt = str(_prompt_src) if _prompt_src is not None else None
+
+
     if _pentry and desc:
         logger.info(
             "[RemoteMemberBootstrap] role persona set on member row member=%s persona_len=%s",
@@ -1768,12 +1793,38 @@ def attach_distributed_local_spawn_guard(
     else:
         logger.warning("[RemoteMemberBootstrap] team_agent has no callable spawn_teammate to guard")
 
+    # setattr(team_agent, _LOCAL_SPAWN_GUARD_ATTR, True)
+    # logger.info(
+    #     "[RemoteMemberBootstrap] distributed local spawn guard attached session_id=%s channel=%s",
+    #     session_id,
+    #     channel_id,
+    # )
+
+    # ADDED: attach predefined-member remote bootstrap sweep even if local spawn guard is already set
     setattr(team_agent, _LOCAL_SPAWN_GUARD_ATTR, True)
     logger.info(
         "[RemoteMemberBootstrap] distributed local spawn guard attached session_id=%s channel=%s",
         session_id,
         channel_id,
     )
+    # Predefined-member roster (team_mode=predefined): build_team registers them
+    # via the BACKEND spawn_member, bypassing the spawn_member tool wrapper, so
+    # nothing drives their remote bootstrap. Install the on_team_built sweep that
+    # reserves+bootstraps each predefined row the way the tool path does.
+    try:
+        attach_predefined_remote_bootstrap_sweep(
+            team_agent,
+            session_id=session_id,
+            channel_id=channel_id,
+        )
+    except Exception as _exc:
+        logger.warning(
+            "[RemoteMemberBootstrap] failed to attach predefined remote bootstrap sweep "
+            "session_id=%s channel=%s: %s",
+            session_id,
+            channel_id,
+            _exc,
+        )
 
 
 def attach_remote_bootstrap_ack_listener(
@@ -2838,3 +2889,231 @@ def attach_remote_teammate_bootstrap_listener(
     team_agent.add_event_listener(on_event)
     setattr(team_agent, _TEAMMATE_BOOTSTRAP_LISTENER_ATTR, True)
     logger.info("[RemoteMemberBootstrap] attached teammate bootstrap listener")
+
+
+
+# ADDED predefined-member remote bootstrap sweep for predefined mode.
+
+# Predefined-member remote bootstrap sweep (benchmark / team_mode=predefined).
+# build_team registers predefined teammates as UNSTARTED rows via the BACKEND
+# spawn_member, bypassing attach_spawn_member_remote_bootstrap_wrapper. This
+# sweep drives the same reserve+bootstrap the tool path does, for each row,
+# from the on_team_built callback. The existing ACK listener finishes READY.
+
+_PREDEFINED_SWEEP_WRAPPED_ATTR = "_jiuwen_predefined_remote_bootstrap_sweep_wrapped"
+
+async def _predefined_remote_bootstrap_sweep(
+    team_agent: Any,
+    *,
+    session_id: str,
+    channel_id: str | None,
+) -> None:
+    """Reserve+bootstrap every not-yet-adopted predefined member row."""
+    from openjiuwen.agent_teams.schema.status import MemberStatus
+    from openjiuwen.agent_teams.schema.team import TeamRole
+    from jiuwenswarm.common.config import get_config as _get_config
+
+    tb = getattr(team_agent, "team_backend", None)
+    db = getattr(tb, "db", None) if tb is not None else None
+    if tb is None or db is None:
+        logger.warning("[RemoteMemberBootstrap] predefined sweep: no team_backend/db; skip")
+        return
+
+    team_name = _team_name_for_agent(team_agent)
+    if not isinstance(team_name, str) or not team_name.strip():
+        logger.warning("[RemoteMemberBootstrap] predefined sweep: no team_name; skip")
+        return
+
+    config_base = _get_config()
+    remote_names = set(remote_member_names(config_base))
+    remote_all = remote_all_spawn_members(config_base)
+
+    leader_member_name = ""
+    spec = getattr(team_agent, "spec", None)
+    if spec is not None:
+        leader_member_name = str(getattr(spec, "leader_member_name", "") or "").strip()
+        if not leader_member_name:
+            _ldr = getattr(spec, "leader", None)
+            leader_member_name = str(getattr(_ldr, "member_name", "") or "").strip()
+
+    try:
+        members = await db.member.get_team_members(team_name)
+    except Exception as exc:
+        logger.warning("[RemoteMemberBootstrap] predefined sweep: get_team_members failed team=%s: %s", team_name, exc)
+        return
+
+    targets: list[str] = []
+    for m in members:
+        mname = str(getattr(m, "member_name", "") or "").strip()
+        if not mname or mname == leader_member_name:
+            continue
+        role = getattr(m, "role", None)
+        try:
+            role_val = role if isinstance(role, TeamRole) else TeamRole(role)
+        except Exception:
+            role_val = TeamRole.TEAMMATE
+        if role_val in (TeamRole.HUMAN_AGENT, TeamRole.BRIDGE_AGENT):
+            continue
+        if str(getattr(m, "status", "") or "") == MemberStatus.READY.value:
+            continue
+        if (not remote_all) and mname not in remote_names:
+            continue
+        targets.append(mname)
+
+    if not targets:
+        logger.info("[RemoteMemberBootstrap] predefined sweep: no remote targets team=%s", team_name)
+        return
+
+    logger.info(
+        "[RemoteMemberBootstrap] predefined sweep: bootstrapping %d member(s) team=%s targets=%s",
+        len(targets), team_name, targets,
+    )
+
+    # for key in targets:
+    #     registry_reservation = None
+    #     try:
+    #         precheck = await precheck_and_reserve_remote_spawn(key, config_base, team_agent=team_agent)
+    #         if precheck.error:
+    #             logger.warning(
+    #                 "[RemoteMemberBootstrap] predefined sweep: reserve failed member=%s: %s "
+    #                 "(left UNSTARTED for a later node/run)",
+    #                 key, precheck.error,
+    #             )
+    #             try:
+    #                 await db.member.update_member_status(key, team_name, MemberStatus.UNSTARTED.value)
+    #             except Exception:
+    #                 pass
+    #             continue
+    #         registry_reservation = precheck.registry_reservation
+
+    #         # mirror the wrapper: ensure row exists (no-op here; build_team wrote it
+    #         # with the persona), then force UNSTARTED until the ACK sets READY.
+    #         await _ensure_remote_member_record(team_agent, key, None)
+    #         await db.member.update_member_status(key, team_name, MemberStatus.UNSTARTED.value)
+    #         logger.info(
+    #             "[RemoteMemberBootstrap] predefined sweep: member=%s forced UNSTARTED before bootstrap team=%s",
+    #             key, team_name,
+    #         )
+
+    #         try:
+    #             delivered = await send_bootstrap_message(
+    #                 team_agent, session_id, key, None,
+    #                 registry_reservation=registry_reservation,
+    #             )
+    #         except Exception as exc:
+    #             logger.warning("[RemoteMemberBootstrap] predefined sweep: bootstrap raised member=%s: %s", key, exc)
+    #             delivered = False
+
+    #         if delivered:
+    #             registry_reservation = None
+    #             logger.info(
+    #                 "[RemoteMemberBootstrap] predefined sweep: bootstrap delivered member=%s team=%s; "
+    #                 "status stays UNSTARTED until MESSAGE ACK sets ready",
+    #                 key, team_name,
+    #             )
+    #         else:
+    #             try:
+    #                 await db.member.update_member_status(key, team_name, MemberStatus.ERROR.value)
+    #             except Exception:
+    #                 pass
+    #             await _release_registry_reservation(
+    #                 registry_reservation, member_name=key, reason="predefined sweep: bootstrap not delivered",
+    #             )
+    #             registry_reservation = None
+    #             logger.warning(
+    #                 "[RemoteMemberBootstrap] predefined sweep: bootstrap NOT delivered member=%s team=%s",
+    #                 key, team_name,
+    #             )
+    #     except Exception as exc:
+    #         logger.warning("[RemoteMemberBootstrap] predefined sweep: member=%s failed: %s", key, exc, exc_info=True)
+    #         await _release_registry_reservation(
+    #             registry_reservation, member_name=key, reason="predefined sweep: exception",
+    #         )
+    #         registry_reservation = None
+
+
+    for key in targets:
+        try:
+            # Predefined rows ALREADY exist (build_team wrote them), so we must NOT
+            # use precheck_and_reserve_remote_spawn — its _existing_team_member guard
+            # rejects pre-existing rows. Force UNSTARTED, then let send_bootstrap_message
+            # reserve a blank teammate itself (its registry_reservation=None branch) and
+            # deliver. The ACK listener flips UNSTARTED->READY on adoption.
+            await db.member.update_member_status(key, team_name, MemberStatus.UNSTARTED.value)
+            logger.info(
+                "[RemoteMemberBootstrap] predefined sweep: member=%s forced UNSTARTED before bootstrap team=%s",
+                key, team_name,
+            )
+
+            try:
+                delivered = await send_bootstrap_message(
+                    team_agent, session_id, key, None,
+                    registry_reservation=None,
+                )
+            except Exception as exc:
+                logger.warning("[RemoteMemberBootstrap] predefined sweep: bootstrap raised member=%s: %s", key, exc)
+                delivered = False
+
+            if delivered:
+                logger.info(
+                    "[RemoteMemberBootstrap] predefined sweep: bootstrap delivered member=%s team=%s; "
+                    "status stays UNSTARTED until MESSAGE ACK sets ready",
+                    key, team_name,
+                )
+            else:
+                # No blank teammate available (e.g. all nodes already adopted) — leave
+                # the row UNSTARTED so a later node/run can pick it up. Do NOT mark ERROR:
+                # with one teammate node, 3 of 4 not being deliverable is expected.
+                logger.warning(
+                    "[RemoteMemberBootstrap] predefined sweep: bootstrap NOT delivered member=%s team=%s "
+                    "(no blank teammate? left UNSTARTED)",
+                    key, team_name,
+                )
+        except Exception as exc:
+            logger.warning(
+                "[RemoteMemberBootstrap] predefined sweep: member=%s failed: %s",
+                key, exc, exc_info=True,
+            )
+
+
+def attach_predefined_remote_bootstrap_sweep(
+    team_agent: Any,
+    *,
+    session_id: str,
+    channel_id: str | None,
+) -> None:
+    """Wrap backend._on_team_built so predefined rows get remote bootstrap after
+    build_team registers them. Preserves the existing callback (_mark_team_built)."""
+    from jiuwenswarm.common.config import get_config as _get_config
+    from openjiuwen.agent_teams.schema.team import TeamRole
+
+    if not _is_distributed_leader_runtime(_get_config()):
+        return
+    if getattr(team_agent, "role", None) != TeamRole.LEADER:
+        return
+    tb = getattr(team_agent, "team_backend", None)
+    if tb is None:
+        logger.warning("[RemoteMemberBootstrap] predefined sweep hook: no team_backend; skip")
+        return
+    if getattr(tb, _PREDEFINED_SWEEP_WRAPPED_ATTR, False):
+        return
+
+    orig_cb = getattr(tb, "_on_team_built", None)
+
+    async def _wrapped_on_team_built() -> None:
+        if orig_cb is not None:
+            await orig_cb()
+        try:
+            await _predefined_remote_bootstrap_sweep(
+                team_agent, session_id=session_id, channel_id=channel_id,
+            )
+        except Exception as exc:
+            logger.warning("[RemoteMemberBootstrap] predefined sweep hook failed: %s", exc, exc_info=True)
+
+    tb._on_team_built = _wrapped_on_team_built
+    setattr(tb, _PREDEFINED_SWEEP_WRAPPED_ATTR, True)
+    logger.info(
+        "[RemoteMemberBootstrap] attached predefined remote bootstrap sweep session_id=%s channel=%s",
+        session_id, channel_id,
+    )
+
