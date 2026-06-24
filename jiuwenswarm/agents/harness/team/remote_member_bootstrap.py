@@ -60,6 +60,14 @@ _TRANSPORT_BOOTSTRAP_KNOWN_PEERS_KEY = "bootstrap_known_peers"
 
 _DYNAMIC_MEMBER_AGENTS: dict[tuple[str, str], Any] = {}
 
+# ADDED : allow override of default pin endpoints for planner/executor/verifier
+# specified ednpoints are used for remote spawn_member bootstrap messages
+_ROLE_PIN_ENDPOINTS = {
+    "planner":  os.environ.get("PIN_PLANNER_ENDPOINT",  "tcp://127.0.0.1:28610"),
+    "executor": os.environ.get("PIN_EXECUTOR_ENDPOINT", "tcp://127.0.0.1:28620"),
+    "verifier": os.environ.get("PIN_VERIFIER_ENDPOINT", "tcp://127.0.0.1:28630"),
+}
+
 
 class RemoteSpawnPrecheck(NamedTuple):
     """Result for remote spawn fail-fast validation."""
@@ -747,10 +755,19 @@ async def _send_bootstrap_message(
             from jiuwenswarm.common.config import get_config as _get_config
             from jiuwenswarm.agents.harness.team.a2x.a2x_registry_runtime import reserve_blank_teammate_agent
 
+            # registry_reservation = await reserve_blank_teammate_agent(
+            #     _get_config(),
+            #     source="leader-spawn-member",
+            # )
+
+            # ADDED : allow override of default pin endpoints for planner/executor/verifier
+            _pin_ep = _ROLE_PIN_ENDPOINTS.get(str(member_name).strip())
             registry_reservation = await reserve_blank_teammate_agent(
                 _get_config(),
                 source="leader-spawn-member",
+                target_endpoint=_pin_ep,
             )
+
             if registry_reservation is not None:
                 peer_agent_id = registry_reservation.service_id
                 peer_addr = _normalize_leader_direct_addr(registry_reservation.endpoint)
@@ -3050,6 +3067,7 @@ async def _predefined_remote_bootstrap_sweep(
                     team_agent, session_id, key, None,
                     registry_reservation=None,
                 )
+
             except Exception as exc:
                 logger.warning("[RemoteMemberBootstrap] predefined sweep: bootstrap raised member=%s: %s", key, exc)
                 delivered = False

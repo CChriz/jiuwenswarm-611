@@ -407,10 +407,18 @@ def _agent_endpoint(agent: dict[str, Any]) -> str:
     return ""
 
 
+# async def reserve_blank_teammate_agent(
+#     config_base: dict[str, Any],
+#     *,
+#     source: str = "leader-bootstrap",
+# ) -> ReservedBlankAgent | None:
+
+# ADDED optional target_endpoint parameter to pin to a specific node's blank
 async def reserve_blank_teammate_agent(
     config_base: dict[str, Any],
     *,
     source: str = "leader-bootstrap",
+    target_endpoint: str | None = None,   # ADDED: pin to a specific node's blank
 ) -> ReservedBlankAgent | None:
     """Reserve one blank teammate from A2X registry for leader bootstrap."""
     client = None
@@ -432,41 +440,103 @@ async def reserve_blank_teammate_agent(
             )
             await client.aclose()
             return None
-        reservation = await client.reserve_blank_agents(
-            dataset=dataset,
-            n=1,
-            ttl_seconds=int(config.get("reservation_ttl_seconds") or 30),
-        )
-        for agent in reservation.agents:
-            if not isinstance(agent, dict):
-                continue
-            service_id = _agent_service_id(agent)
-            endpoint = _agent_endpoint(agent)
-            if service_id and endpoint:
-                logger.info(
-                    "[A2XRegistryRuntime] reserved blank teammate source=%s dataset=%s "
-                    "service_id=%s endpoint=%s holder_id=%s",
-                    source,
-                    dataset,
-                    service_id,
-                    endpoint,
-                    getattr(reservation, "holder_id", ""),
-                )
-                return ReservedBlankAgent(
-                    client=client,
-                    reservation=reservation,
+        # reservation = await client.reserve_blank_agents(
+        #     dataset=dataset,
+        #     n=1,
+        #     ttl_seconds=int(config.get("reservation_ttl_seconds") or 30),
+        # )
+        # for agent in reservation.agents:
+        #     if not isinstance(agent, dict):
+        #         continue
+        #     service_id = _agent_service_id(agent)
+        #     endpoint = _agent_endpoint(agent)
+        #     if service_id and endpoint:
+        #         logger.info(
+        #             "[A2XRegistryRuntime] reserved blank teammate source=%s dataset=%s "
+        #             "service_id=%s endpoint=%s holder_id=%s",
+        #             source,
+        #             dataset,
+        #             service_id,
+        #             endpoint,
+        #             getattr(reservation, "holder_id", ""),
+        #         )
+        #         return ReservedBlankAgent(
+        #             client=client,
+        #             reservation=reservation,
+        #             dataset=dataset,
+        #             service_id=service_id,
+        #             endpoint=endpoint,
+        #         )
+        # logger.info(
+        #     "[A2XRegistryRuntime] no usable blank teammate reservation source=%s dataset=%s",
+        #     source,
+        #     dataset,
+        # )
+        # await client.release_reservation(reservation)
+        # await client.aclose()
+        # return None
+
+        # ADDED: pin to a specific node's blank
+        
+        _want = str(target_endpoint or "").strip()
+        _rejected = []  # non-matching reservations to release at the end
+        try:
+            for _attempt in range(8):
+                reservation = await client.reserve_blank_agents(
                     dataset=dataset,
-                    service_id=service_id,
-                    endpoint=endpoint,
+                    n=1,
+                    ttl_seconds=int(config.get("reservation_ttl_seconds") or 30),
                 )
+                picked = None
+                for agent in reservation.agents:
+                    if not isinstance(agent, dict):
+                        continue
+                    service_id = _agent_service_id(agent)
+                    endpoint = _agent_endpoint(agent)
+                    if service_id and endpoint:
+                        picked = (service_id, endpoint)
+                        break
+                if picked is None:
+                    await client.release_reservation(reservation)
+                    break
+                service_id, endpoint = picked
+                if not _want or endpoint.strip() == _want:
+                    logger.info(
+                        "[A2XRegistryRuntime] reserved blank teammate source=%s dataset=%s "
+                        "service_id=%s endpoint=%s target=%s",
+                        source, dataset, service_id, endpoint, _want or "(any)",
+                    )
+                    for r in _rejected:
+                        try:
+                            await client.release_reservation(r)
+                        except Exception:
+                            pass
+                    return ReservedBlankAgent(
+                        client=client,
+                        reservation=reservation,
+                        dataset=dataset,
+                        service_id=service_id,
+                        endpoint=endpoint,
+                    )
+                _rejected.append(reservation)
+            for r in _rejected:
+                try:
+                    await client.release_reservation(r)
+                except Exception:
+                    pass
+        except Exception as _exc:
+            logger.warning(
+                "[A2XRegistryRuntime] pinned reservation error source=%s dataset=%s target=%s: %s",
+                source, dataset, _want or "(any)", _exc,
+            )
         logger.info(
-            "[A2XRegistryRuntime] no usable blank teammate reservation source=%s dataset=%s",
-            source,
-            dataset,
+            "[A2XRegistryRuntime] no usable blank teammate reservation source=%s dataset=%s target=%s",
+            source, dataset, _want or "(any)",
         )
-        await client.release_reservation(reservation)
         await client.aclose()
         return None
+
+
     except Exception as exc:
         logger.warning(
             "[A2XRegistryRuntime] blank teammate reservation failed source=%s: %s",
