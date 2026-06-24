@@ -156,7 +156,6 @@ D6 merges subscriber records from System A (Identity) and System B (Subscription
 - **Layer 2 tool rules** (`agent_configurator.py` exclude/RailSpec seam): Verifier denied the `run` tool; Verifier `write` path-scoped to `attestation.json`; the path-guard implemented as the crossing counter (log-and-allow vs log-and-refuse). This is the instrument that produces the comparison numbers.
 - **Prompt-only arm:** identical personas/task/leader, ACLs *off*, tool-guard set to log-and-allow. The A/B is "did the ACL script run." (The run scripts are structured so the prompt-only arm is the enforced arm minus `01_apply_acls.sh`.)
 - **Message-channel decision:** accept as measured (current), or redesign (per-role message stores / don't persist bodies to the shared DB) if message-content boundaries must be kernel-real.
-- **Rotate the DeepSeek API key** (it was in plaintext during development; scripts now read `$DEEPSEEK_API_KEY` from the environment instead of hardcoding).
 - **Commit the environment setup** (run scripts + persona config) alongside the code, so the enforced arm is reproducible from the repo rather than from this build's notes.
 
 ---
