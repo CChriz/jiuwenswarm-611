@@ -21,6 +21,7 @@ from openjiuwen.core.foundation.llm import (
 )
 from openjiuwen.core.session.agent import Session
 from openjiuwen.core.session.stream import OutputSchema
+from types import SimpleNamespace as _CapChunk  # teammate stream-capture shim
 from openjiuwen.core.single_agent.rail.base import (
     AgentCallbackContext,
     InvokeInputs,
@@ -281,6 +282,9 @@ class JiuSwarmStreamEventRail(DeepAgentRail):
         # cross-session leakage in concurrent collect→get→clear sequences).
         self._cancelled_tool_results: dict[str, list[dict[str, Any]]] = {}
         self._symphony_status_tokens: dict[str, Any] = {}
+        # Per-node stream capture (lazily opened on first emitted chunk).
+        self._capture = None
+        self._capture_failed = False
 
     def init(self, agent: Any) -> None:
         self._deep_agent = agent
@@ -317,6 +321,83 @@ class JiuSwarmStreamEventRail(DeepAgentRail):
                     ctx.extra[self._SID_KEY] = known_sid
                     return known_sid
         return "default"
+
+
+    def _feed_capture_chunk(self, data):
+        """Feed one raw OutputSchema/dict chunk to this node's per-node capture.
+
+        Catches every chunk routed through session.write_stream. Lazily opens a
+        per-node TeamStreamCapture (role from HOME). One-shot probe logs the
+        first chunk type seen so we can confirm reasoning flows through here.
+        """
+        if self._capture_failed:
+            return
+        try:
+            if self._capture is None:
+                import os as _os
+                from pathlib import Path as _P
+                from jiuwenswarm.common.utils import get_user_workspace_dir
+                from jiuwenswarm.agents.harness.team.handlers.team_stream_capture import (
+                    TeamStreamCapture,
+                )
+                _NODE_ROLE = {"node1": "planner", "node2": "executor", "node3": "verifier"}
+                _home = _P(_os.environ.get("HOME", "")).name
+                who = (self._member_name
+                       or _NODE_ROLE.get(_home)
+                       or _os.environ.get("USER", "").replace("jw_", "")
+                       or "member")
+                traces = get_user_workspace_dir() / ".agent_teams" / "traces"
+                traces.mkdir(parents=True, exist_ok=True)
+                stem = f"stream-node-{who}-full"
+                self._capture = TeamStreamCapture(
+                    jsonl_path=str(traces / f"{stem}.jsonl"),
+                    dump_path=str(traces / f"{stem}.dump.txt"),
+                )
+                self._capture_who = who
+            self._capture.feed(data)
+        except Exception:
+            self._capture_failed = True
+
+    def _feed_capture(self, ctype, payload, sid):
+        """Tee one emitted stream event into this node's per-node JSONL trace.
+
+        Distributed teammates run in their own process and emit locally; this
+        writes a per-node trace under THIS process's HOME-relative workspace.
+        Never raises into the run; disables itself on first failure.
+        """
+        if self._capture_failed:
+            return
+        try:
+            if self._capture is None:
+                import os as _os
+                from pathlib import Path as _P
+                from jiuwenswarm.common.utils import get_user_workspace_dir
+                from jiuwenswarm.agents.harness.team.handlers.team_stream_capture import (
+                    TeamStreamCapture,
+                )
+                _NODE_ROLE = {"node1": "planner", "node2": "executor", "node3": "verifier"}
+                _home_name = _P(_os.environ.get("HOME", "")).name
+                who = (self._member_name
+                       or _NODE_ROLE.get(_home_name)
+                       or _os.environ.get("USER", "").replace("jw_", "")
+                       or "member")
+                traces = get_user_workspace_dir() / ".agent_teams" / "traces"
+                traces.mkdir(parents=True, exist_ok=True)
+                stem = f"stream-node-{who}-{sid or 'session'}"
+                self._capture = TeamStreamCapture(
+                    jsonl_path=str(traces / f"{stem}.jsonl"),
+                    dump_path=str(traces / f"{stem}.dump.txt"),
+                )
+                self._capture_who = who
+            chunk = _CapChunk(
+                type=ctype,
+                payload=payload,
+                source_member=getattr(self, "_capture_who", None),
+                role=getattr(self, "_capture_who", None),
+            )
+            self._capture.feed(chunk)
+        except Exception:
+            self._capture_failed = True
 
     # -- pause / resume / abort API for interface.py --
     # All methods accept session_id to scope state per-session on shared adapters.
@@ -494,6 +575,26 @@ class JiuSwarmStreamEventRail(DeepAgentRail):
 
     async def before_model_call(self, ctx: AgentCallbackContext) -> None:
         sid = self._resolve_sid(ctx, ctx.session)
+
+        # --- wrap write_stream to capture the full stream (idempotent) ---
+        try:
+            _sess = ctx.session
+            if _sess is not None and not getattr(_sess, "_jw_cap_wrapped", False):
+                _orig_ws = _sess.write_stream
+                _rail = self
+                async def _jw_tee_write_stream(data, *a, __orig=_orig_ws, **k):
+                    try:
+                        _rail._feed_capture_chunk(data)
+                    except Exception:
+                        pass
+                    return await __orig(data, *a, **k)
+                try:
+                    _sess.write_stream = _jw_tee_write_stream
+                    _sess._jw_cap_wrapped = True
+                except Exception:
+                    logger.debug("[StreamEventRail] write_stream not wrappable", exc_info=True)
+        except Exception:
+            logger.debug("[StreamEventRail] write_stream wrap failed", exc_info=True)
         await self._get_pause_event(sid).wait()
         if self._abort_requested.get(sid, False):
             raise asyncio.CancelledError("Agent abort requested")
@@ -522,6 +623,10 @@ class JiuSwarmStreamEventRail(DeepAgentRail):
         if session is not None and isinstance(ctx.inputs, ToolCallInputs):
             tc = ctx.inputs.tool_call
             await self._emit_tool_call(session, tc)
+            self._feed_capture("tool_call", {
+                "tool_name": getattr(tc, "name", ""),
+                "tool_args": getattr(tc, "arguments", {}),
+            }, sid)
             await self._emit_tool_update(session, tc, status="in_progress")
             tool_name = str(getattr(tc, "name", "") or "").strip()
             if tool_name == "symphony_compose_score":
@@ -556,6 +661,18 @@ class JiuSwarmStreamEventRail(DeepAgentRail):
             self._inflight_tool_calls.pop(tc_id, None)
 
         await self._emit_tool_result(session, tc, ctx.inputs.tool_result)
+
+        _cap_sid = self._resolve_sid(ctx, session)
+
+        self._feed_capture("tool_result", {
+
+            "tool_name": getattr(tc, "name", "") if tc else "",
+
+            "tool_result": str(ctx.inputs.tool_result)[:60000]
+
+                           if ctx.inputs.tool_result is not None else "",
+
+        }, _cap_sid)
         await self._emit_symphony_direct_display(session, tc, ctx.inputs.tool_result)
         if tc_id:
             reset_symphony_status_events(
