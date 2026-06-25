@@ -1,4 +1,4 @@
-# Jiuwenswarm (6/11) - In-depth Stream Capture 
+# Jiuwenswarm (6/11) - In-depth Stream Capture (to be updated for distributed mode compatibility)
 
 An addition to JiuwenSwarm "team mode" that reconstructs, for any completed team
 run, a faithful per-agent record of what each agent did: its reasoning, the
