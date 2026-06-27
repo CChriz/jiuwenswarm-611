@@ -1,5 +1,7 @@
 # Jiuwenswarm (6/11) - In-depth Stream Capture (to be updated for distributed mode compatibility)
 
+## check `distributed-mode-fixes` branch for active changes
+
 An addition to JiuwenSwarm "team mode" that reconstructs, for any completed team
 run, a faithful per-agent record of what each agent did: its reasoning, the
 messages it sent, the tools it invoked, the file changes it made (full write
